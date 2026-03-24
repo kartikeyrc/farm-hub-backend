@@ -1,140 +1,150 @@
 import os
 import json
+import time
 import requests
 import paho.mqtt.client as mqtt
-from fastapi import FastAPI, BackgroundTasks, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 import firebase_admin
 from firebase_admin import credentials, firestore
 
 # =================================================================
-# 1. CONFIGURATION & CREDENTIALS
+# 1. CONFIGURATION & STATE
 # =================================================================
-# Load from Environment Variables for security during deployment
-MQTT_BROKER = os.getenv("MQTT_BROKER", "YOUR_HIVEMQ_URL.s1.eu.hivemq.cloud")
-MQTT_PORT = 8883
-MQTT_USER = os.getenv("MQTT_USER", "farm_admin")
-MQTT_PASS = os.getenv("MQTT_PASS", "your_password")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "YOUR_GROQ_API_KEY")
+MQTT_BROKER = os.getenv("MQTT_BROKER", "a9fb2e5334c04fb490a9ba3ed3deacde.s1.eu.hivemq.cloud")
+MQTT_USER = os.getenv("MQTT_USER", "admin")
+MQTT_PASS = os.getenv("MQTT_PASS", "KRC077@admin")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "your_groq_key")
 
 TOPIC_TELEMETRY = "farm/user123/telemetry"
 TOPIC_CONTROL = "farm/user123/control"
 
-# Global state to hold the latest ESP32 data (The "Fog" Cache)
-latest_telemetry = {
-    "m10": 0, "m30": 0, "m60": 0, 
-    "temp": 0.0, "hum": 0.0, "pump_status": 0
+app = FastAPI()
+
+# Enable CORS for your React Localhost
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize Firebase (Ensure you have your serviceAccountKey.json)
+# If deploying to Render, use environment variables to build the credential object
+if not firebase_admin._apps:
+    cred = credentials.Certificate("serviceAccountKey.json")
+    firebase_admin.initialize_app(cred)
+
+db = firestore.client()
+
+# In-memory "Fog Cache" with Heartbeat
+system_state = {
+    "telemetry": {
+        "m10": 0, "m30": 0, "m60": 0, 
+        "temp": 0.0, "hum": 0.0, "pump_status": 0,
+        "last_seen": 0
+    },
+    "weather": [],
+    "device_online": False
 }
 
-app = FastAPI(title="Agro-Agent Cognitive Core")
-
-# Initialize Firebase (Requires your service account JSON file)
-# cred = credentials.Certificate("firebase-adminsdk.json")
-# firebase_admin.initialize_app(cred)
-# db = firestore.client()
-
 # =================================================================
-# 2. MQTT BACKGROUND THREAD (Perception Listener)
+# 2. MQTT ORCHESTRATOR
 # =================================================================
-def on_connect(client, userdata, flags, rc):
-    print(f"Connected to HiveMQ with result code {rc}")
-    client.subscribe(TOPIC_TELEMETRY)
-
 def on_message(client, userdata, msg):
-    global latest_telemetry
     try:
-        payload = json.loads(msg.payload.decode())
-        latest_telemetry.update(payload)
-        print(f"[MQTT] Telemetry Updated: {latest_telemetry}")
+        data = json.loads(msg.payload.decode())
+        system_state["telemetry"].update(data)
+        system_state["telemetry"]["last_seen"] = time.time()
+        print(f"[MQTT] Received Data from ESP32: {data}")
     except Exception as e:
-        print(f"Error parsing MQTT: {e}")
+        print(f"MQTT Error: {e}")
 
-mqtt_client = mqtt.Client(client_id="Agro-Python-Backend")
+mqtt_client = mqtt.Client()
 mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
-mqtt_client.tls_set() # Enable secure connection for Port 8883
-mqtt_client.on_connect = on_connect
+mqtt_client.tls_set()
 mqtt_client.on_message = on_message
-
-# Start MQTT loop in the background
-mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+mqtt_client.connect(MQTT_BROKER, 8883, 60)
 mqtt_client.loop_start()
 
 # =================================================================
-# 3. DATA FUSION & API LOGIC
+# 3. LOGIC & DATA FUSION
 # =================================================================
-def fetch_weather_data():
-    """Fetches Rain Probability and ET0 from Open-Meteo"""
-    url = "https://api.open-meteo.com/v1/forecast?latitude=21.1768645&longitude=79.0606934&daily=precipitation_probability_max,et0_fao_evapotranspiration&timezone=Asia%2FKolkata&forecast_days=1"
-    try:
-        res = requests.get(url)
-        data = res.json()
-        return {
-            "rainProb": data["daily"]["precipitation_probability_max"][0],
-            "evapotranspiration": data["daily"]["et0_fao_evapotranspiration"][0]
-        }
-    except Exception as e:
-        print(f"Weather API Error: {e}")
-        return {"rainProb": 0, "evapotranspiration": 0.0}
 
-def fetch_firebase_context(user_id: str):
-    """Mocks fetching Soil, Crop, and Sow Date from Firebase"""
-    # In production: doc = db.collection('farms').document(user_id).get()
+def get_device_status():
+    """Calculates if the ESP32 is actually powered on"""
+    # Logic: If last message was > 60 seconds ago, it's offline
+    is_online = (time.time() - system_state["telemetry"]["last_seen"]) < 60
+    return is_online
+
+def fetch_3_day_weather():
+    """Fetches 3 days of forecast to fix the empty future tiles"""
+    # Changed forecast_days to 3
+    url = "https://api.open-meteo.com/v1/forecast?latitude=21.17&longitude=79.06&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,et0_fao_evapotranspiration&timezone=Asia%2FKolkata&forecast_days=3"
+    try:
+        res = requests.get(url).json()
+        forecast = []
+        for i in range(3):
+            forecast.append({
+                "date": res["daily"]["time"][i],
+                "max_temp": res["daily"]["temperature_2m_max"][i],
+                "min_temp": res["daily"]["temperature_2m_min"][i],
+                "rain_prob": res["daily"]["precipitation_probability_max"][i],
+                "et0": res["daily"]["et0_fao_evapotranspiration"][i]
+            })
+        return forecast
+    except:
+        return []
+
+@app.get("/api/system-status")
+async def get_full_status():
+    """React calls this to get Telemetry + Weather + Online Status at once"""
+    online = get_device_status()
+    weather = fetch_3_day_weather()
     return {
-        "soil_type": "Black Cotton Soil",
-        "crop_type": "Soybean",
-        "days_since_sow": 45
+        "telemetry": system_state["telemetry"],
+        "weather": weather,
+        "is_online": online
     }
 
 @app.post("/api/ask-ai")
-async def trigger_ai_watering_decision():
-    """
-    The main Agentic Data Fusion Endpoint. 
-    Triggered by React Dashboard 'Should I Water?' button.
-    """
-    # 1. Gather Data Vector
-    weather = fetch_weather_data()
-    farm_context = fetch_firebase_context("user123")
+async def trigger_agentic_decision():
+    """Agentic AI reasoning using Real Firebase Context"""
     
-    # Mathematical Data Fusion
-    fusion_state = {**latest_telemetry, **weather, **farm_context}
+    # 1. Fetch Real User Selections from Firebase
+    user_doc = db.collection('users').document('user123').get()
+    if not user_doc.exists:
+        raise HTTPException(status_code=404, detail="User settings not found in Firebase")
     
-    # 2. Construct Prompt for Groq
-    system_prompt = """You are an Agritech AI. Evaluate the provided environmental and crop data. 
-    Decide if the pump should turn on (1) or stay off (0). 
-    Calculate target moisture thresholds (0-100) for 10cm and 30cm depth. 
-    Output ONLY a raw, minified JSON object: {"pumpCommand":1,"thresh10":65,"thresh30":60}"""
+    user_settings = user_doc.to_dict()
+    weather = fetch_3_day_weather()
     
+    # 2. Data Fusion Vector
+    fusion_context = {
+        "sensors": system_state["telemetry"],
+        "forecast": weather[0], # Today's forecast
+        "farm": user_settings # Actual Soil/Crop from Firebase
+    }
+
+    # 3. AI Reasoning (Prompt matches your ESP32 structure)
+    system_prompt = """You are an Agritech AI. Reason based on sensors, weather, and soil type.
+    Decide if the pump should turn on. 
+    Output ONLY: {"pumpCommand":1,"thresh10":65,"thresh30":60}"""
+    
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
     payload = {
-        "model": "llama3-8b-8192", # Update to valid Groq model
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": json.dumps(fusion_state)}
-        ],
-        "temperature": 0.1,
+        "model": "llama3-8b-8192",
+        "messages": [{"role": "system", "content": system_prompt},
+                     {"role": "user", "content": json.dumps(fusion_context)}],
         "response_format": {"type": "json_object"}
     }
-    
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    
-    # 3. Call Groq
+
     response = requests.post("https://api.groq.com/openai/v1/chat/completions", json=payload, headers=headers)
     
     if response.status_code == 200:
-        ai_output = response.json()["choices"][0]["message"]["content"]
-        command_json = json.loads(ai_output)
-        
-        # 4. Publish Command to ESP32 via MQTT
-        mqtt_client.publish(TOPIC_CONTROL, json.dumps(command_json))
-        
-        return {
-            "status": "success", 
-            "fusion_data": fusion_state, 
-            "ai_decision": command_json
-        }
-    else:
-        raise HTTPException(status_code=500, detail="Groq API Failed")
-
-# Run locally using: uvicorn main:app --reload
+        decision = json.loads(response.json()["choices"][0]["message"]["content"])
+        # 4. Push to ESP32
+        mqtt_client.publish(TOPIC_CONTROL, json.dumps(decision))
+        return decision
+    
+    raise HTTPException(status_code=500, detail="AI Brain Error")
