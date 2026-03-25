@@ -31,11 +31,30 @@ app.add_middleware(
 
 # Initialize Firebase (Ensure you have your serviceAccountKey.json)
 # If deploying to Render, use environment variables to build the credential object
-if not firebase_admin._apps:
-    cred = credentials.Certificate("serviceAccountKey.json")
-    firebase_admin.initialize_app(cred)
+def initialize_firebase():
+    # Check if we are running in production (Render) or local
+    service_account_info = os.getenv("FIREBASE_SERVICE_ACCOUNT")
 
-db = firestore.client()
+    if service_account_info:
+        # PRODUCTION: Parse the JSON string from the Environment Variable
+        info = json.loads(service_account_info)
+        cred = credentials.Certificate(info)
+        print("Firebase initialized via Environment Variable.")
+    else:
+        # LOCAL: Use the local file (only works on your computer)
+        try:
+            cred = credentials.Certificate("serviceAccountKey.json")
+            print("Firebase initialized via local JSON file.")
+        except Exception as e:
+            print(f"Error: No Firebase credentials found! {e}")
+            return None
+
+    if not firebase_admin._apps:
+        firebase_admin.initialize_app(cred)
+    
+    return firestore.client()
+
+db = initialize_firebase()
 
 # In-memory "Fog Cache" with Heartbeat
 system_state = {
