@@ -16,8 +16,8 @@ MQTT_USER = os.getenv("MQTT_USER", "admin")
 MQTT_PASS = os.getenv("MQTT_PASS", "KRC077@admin")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "your_groq_key")
 
-TOPIC_TELEMETRY = "farm/user123/telemetry"
-TOPIC_CONTROL = "farm/user123/control"
+TOPIC_TELEMETRY = "farm/Ln3CH2gdXXMzI5Whq8nMxughdvi1/telemetry"
+TOPIC_CONTROL = "farm/Ln3CH2gdXXMzI5Whq8nMxughdvi1/control"
 
 app = FastAPI()
 
@@ -131,7 +131,7 @@ async def trigger_agentic_decision():
     """Agentic AI reasoning using Real Firebase Context"""
     
     # 1. Fetch Real User Selections from Firebase
-    user_doc = db.collection('users').document('user123').get()
+    user_doc = db.collection('users').document('Ln3CH2gdXXMzI5Whq8nMxughdvi1').get()
     if not user_doc.exists:
         raise HTTPException(status_code=404, detail="User settings not found in Firebase")
     
