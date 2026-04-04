@@ -12,12 +12,14 @@ from firebase_admin import credentials, firestore
 # 1. CONFIGURATION & STATE
 # =================================================================
 MQTT_BROKER = os.getenv("MQTT_BROKER", "a9fb2e5334c04fb490a9ba3ed3deacde.s1.eu.hivemq.cloud")
-MQTT_USER = os.getenv("MQTT_USER", "admin")
-MQTT_PASS = os.getenv("MQTT_PASS", "KRC077@admin")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "your_groq_key")
+MQTT_USER = os.getenv("MQTT_USER", "hivemq.webclient.1775342210787")
+MQTT_PASS = os.getenv("MQTT_PASS", "9$cRMnP3@s4CdI,lV5f.")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "GROQ_API_KEY")
 
-TOPIC_TELEMETRY = "farm/Ln3CH2gdXXMzI5Whq8nMxughdvi1/telemetry"
-TOPIC_CONTROL = "farm/Ln3CH2gdXXMzI5Whq8nMxughdvi1/control"
+from pydantic import BaseModel
+
+TOPIC_TELEMETRY = "farm/+/telemetry"
+# Control topic is now dynamic per UID
 
 app = FastAPI()
 
@@ -56,26 +58,31 @@ def initialize_firebase():
 
 db = initialize_firebase()
 
-# In-memory "Fog Cache" with Heartbeat
-system_state = {
-    "telemetry": {
-        "m10": 0, "m30": 0, "m60": 0, 
-        "temp": 0.0, "hum": 0.0, "pump_status": 0,
-        "last_seen": 0
-    },
-    "weather": [],
-    "device_online": False
-}
+# In-memory "Fog Cache" with Heartbeat per User
+system_states = {}
 
 # =================================================================
 # 2. MQTT ORCHESTRATOR
 # =================================================================
 def on_message(client, userdata, msg):
     try:
-        data = json.loads(msg.payload.decode())
-        system_state["telemetry"].update(data)
-        system_state["telemetry"]["last_seen"] = time.time()
-        print(f"[MQTT] Received Data from ESP32: {data}")
+        parts = msg.topic.split('/')
+        if len(parts) >= 3:
+            uid = parts[1]
+            data = json.loads(msg.payload.decode())
+            if uid not in system_states:
+                system_states[uid] = {
+                    "telemetry": {
+                        "m10": 0, "m30": 0, "m60": 0, 
+                        "temp": 0.0, "hum": 0.0, "pump_status": 0,
+                        "last_seen": 0
+                    },
+                    "weather": [],
+                    "device_online": False
+                }
+            system_states[uid]["telemetry"].update(data)
+            system_states[uid]["telemetry"]["last_seen"] = time.time()
+            print(f"[MQTT] Received Data from ESP32 for {uid}: {data}")
     except Exception as e:
         print(f"MQTT Error: {e}")
 
@@ -84,16 +91,19 @@ mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
 mqtt_client.tls_set()
 mqtt_client.on_message = on_message
 mqtt_client.connect(MQTT_BROKER, 8883, 60)
+mqtt_client.subscribe(TOPIC_TELEMETRY)
 mqtt_client.loop_start()
 
 # =================================================================
 # 3. LOGIC & DATA FUSION
 # =================================================================
 
-def get_device_status():
+def get_device_status(uid: str):
     """Calculates if the ESP32 is actually powered on"""
+    if uid not in system_states:
+        return False
     # Logic: If last message was > 60 seconds ago, it's offline
-    is_online = (time.time() - system_state["telemetry"]["last_seen"]) < 60
+    is_online = (time.time() - system_states[uid]["telemetry"]["last_seen"]) < 60
     return is_online
 
 def fetch_3_day_weather():
@@ -116,33 +126,41 @@ def fetch_3_day_weather():
         return []
 
 @app.get("/api/system-status")
-async def get_full_status():
+async def get_full_status(uid: str):
     """React calls this to get Telemetry + Weather + Online Status at once"""
-    online = get_device_status()
+    online = get_device_status(uid)
     weather = fetch_3_day_weather()
+    telemetry = system_states[uid]["telemetry"] if uid in system_states else {}
     return {
-        "telemetry": system_state["telemetry"],
+        "telemetry": telemetry,
         "weather": weather,
         "is_online": online
     }
 
+class AskAIRequest(BaseModel):
+    uid: str
+    message: str
+
 @app.post("/api/ask-ai")
-async def trigger_agentic_decision():
+async def trigger_agentic_decision(req: AskAIRequest):
     """Agentic AI reasoning using Real Firebase Context"""
+    uid = req.uid
     
     # 1. Fetch Real User Selections from Firebase
-    user_doc = db.collection('users').document('Ln3CH2gdXXMzI5Whq8nMxughdvi1').get()
+    user_doc = db.collection('users').document(uid).get()
     if not user_doc.exists:
         raise HTTPException(status_code=404, detail="User settings not found in Firebase")
     
     user_settings = user_doc.to_dict()
     weather = fetch_3_day_weather()
+    current_sensors = system_states.get(uid, {}).get("telemetry", {})
     
     # 2. Data Fusion Vector
     fusion_context = {
-        "sensors": system_state["telemetry"],
-        "forecast": weather[0], # Today's forecast
-        "farm": user_settings # Actual Soil/Crop from Firebase
+        "sensors": current_sensors,
+        "forecast": weather[0] if weather else {}, # Today's forecast
+        "farm": user_settings, # Actual Soil/Crop from Firebase
+        "user_message": req.message # Pass the user message to LLM
     }
 
     # 3. AI Reasoning (Prompt matches your ESP32 structure)
@@ -162,8 +180,14 @@ async def trigger_agentic_decision():
     
     if response.status_code == 200:
         decision = json.loads(response.json()["choices"][0]["message"]["content"])
+        
+        # Save AI decision to Firebase for history tracking
+        decision["timestamp"] = firestore.SERVER_TIMESTAMP
+        db.collection("users").document(uid).collection("ai_decisions").add(decision)
+        
         # 4. Push to ESP32
-        mqtt_client.publish(TOPIC_CONTROL, json.dumps(decision))
+        topic_control = f"farm/{uid}/control"
+        mqtt_client.publish(topic_control, json.dumps(decision))
         return decision
     
     raise HTTPException(status_code=500, detail="AI Brain Error")
